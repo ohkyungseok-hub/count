@@ -1,22 +1,18 @@
 # app.py
-# ✅ 요구사항 반영 완성본
+# ✅ UI에서 "할인 차감 여부" 토글 지원 버전
 #
-# 1) 여러 엑셀 업로드 → 병합
-# 2) 결제번호 기준
-#    - 총 결제액: 결제번호당 1회
-#    - 매입원가: 라인 합산 (매입가 * 주문상품수량)
-#    - 할인: 라인 합산 (해당 아이템 개별상품할인액 * 주문상품수량)
-#    - 배송비: 결제번호당 1회 (엑셀 값 사용)
-#      * 단, 결제번호에 '미로상사'가 포함되어 있고 AND 엑셀 배송비가 0/빈값이면 추가로 4000원 더 차감
-# 3) 복수 스토어 결제번호일 때:
-#    - 총 결제액을 '실 주문상품액(결제기준)'(없으면 주문기준, 없으면 균등) 비율로 스토어별 안분
-#    - 배송비(결제번호 1회)도 동일 비율로 스토어별 안분
-#    - 스토어별 매출총이익 = 안분결제액 − (스토어 원가/할인/안분배송비)
-# 4) 결과 엑셀 시트:
-#    - 결제번호별
-#    - 결제번호-스토어별(안분 상세)
-#    - 스토어별_일자별
-#    - 전체합계
+# - 여러 엑셀 업로드 → 병합
+# - 결제번호 기준:
+#   * 총 결제액: 1회
+#   * 매입원가: 라인 합산 (매입가*수량)
+#   * 할인: (개별상품할인액*수량) 라인 합산
+#   * 배송비: 결제번호당 1회(엑셀 값)
+#     - 단, 결제번호에 미로상사 포함 & 엑셀 배송비가 0이면 4000 추가 차감
+# - 복수 스토어 결제번호:
+#   * 총 결제액을 실 주문상품액(결제기준) 비율로 스토어별 안분 (없으면 주문기준, 없으면 균등)
+#   * 배송비도 동일 비율로 안분
+# - UI 토글: "할인 차감" 여부 선택 (ON/OFF)
+# - 결과 엑셀 시트: 결제번호별 / 결제번호-스토어별 / 스토어별_일자별 / 전체합계 (+옵션 미리보기)
 
 import re
 from io import BytesIO
@@ -31,7 +27,6 @@ import streamlit as st
 # Helpers
 # -----------------------------
 def to_number(x) -> float:
-    """숫자/문자(쉼표 포함, ( ) 음수) → float. 실패 시 0."""
     if pd.isna(x):
         return 0.0
     if isinstance(x, (int, float, np.integer, np.floating)):
@@ -49,7 +44,6 @@ def to_number(x) -> float:
 
 
 def pick_shipping_col(df: pd.DataFrame) -> Optional[str]:
-    """배송비 컬럼 우선순위"""
     if "총 배송 및 배달비(결제기준)" in df.columns:
         return "총 배송 및 배달비(결제기준)"
     if "실 배송 및 배달비(주문기준)" in df.columns:
@@ -58,7 +52,6 @@ def pick_shipping_col(df: pd.DataFrame) -> Optional[str]:
 
 
 def pick_alloc_basis_col(df: pd.DataFrame) -> Optional[str]:
-    """결제액 안분 기준 컬럼 우선순위"""
     if "실 주문상품액(결제기준)" in df.columns:
         return "실 주문상품액(결제기준)"
     if "실 주문상품액(주문기준)" in df.columns:
@@ -105,6 +98,7 @@ def compute_results(
     df: pd.DataFrame,
     miro_store_name: str = "미로상사",
     miro_extra_shipping: float = 4000.0,
+    deduct_discount: bool = True,  # ✅ UI 토글 반영
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, str, Optional[str]]:
     work = df.copy()
 
@@ -164,7 +158,7 @@ def compute_results(
 
     # ✅ 최종 배송비(결제번호 1회)
     # - 기본: 엑셀 배송비(1회)
-    # - 추가: 미로상사 포함 & 엑셀 배송비가 0/빈값이면 4000 추가 차감
+    # - 추가: 미로상사 포함 & 엑셀 배송비가 0이면 4000 추가 차감
     pay_ship = pay_ship_raw.merge(has_miro, on="결제번호", how="left")
     pay_ship["배송비_원본(결제번호 1회)"] = pay_ship["배송비_원본(결제번호 1회)"].fillna(0.0).astype(float)
     pay_ship["미로상사포함"] = pay_ship["미로상사포함"].fillna(False)
@@ -227,7 +221,6 @@ def compute_results(
             np.nan,
         )
     else:
-        # 안분기준 없으면 스토어 균등 안분
         store_counts = (
             store_alloc.groupby("결제번호", dropna=False)["스토어명"]
             .nunique()
@@ -247,11 +240,14 @@ def compute_results(
     store_alloc["안분결제액"] = store_alloc["총 결제액(1회)"].fillna(0.0) * store_alloc["안분비율"]
     store_alloc["안분배송비"] = store_alloc["배송비(적용, 결제번호 1회)"].fillna(0.0) * store_alloc["안분비율"]
 
+    # ✅ 할인 차감 토글 반영
+    discount_to_deduct = store_alloc["할인(수량반영)"] if deduct_discount else 0.0
+
     # 스토어별 이익/마진
     store_alloc["스토어별_매출총이익"] = (
         store_alloc["안분결제액"].fillna(0.0)
         - store_alloc["매입원가"].fillna(0.0)
-        - store_alloc["할인(수량반영)"].fillna(0.0)
+        - discount_to_deduct
         - store_alloc["안분배송비"].fillna(0.0)
     )
     store_alloc["스토어별_마진율(%)"] = np.where(
@@ -284,10 +280,13 @@ def compute_results(
         }
     )
 
+    # ✅ 할인 차감 토글 반영 (결제번호별)
+    discount_sum_to_deduct = payment_result["할인합_수량반영"] if deduct_discount else 0.0
+
     payment_result["매출총이익"] = (
         payment_result["총 결제액(1회)"].fillna(0.0)
         - payment_result["매입원가합"].fillna(0.0)
-        - payment_result["할인합_수량반영"].fillna(0.0)
+        - discount_sum_to_deduct
         - payment_result["배송비(적용, 1회)"].fillna(0.0)
     )
     payment_result["마진율(%)"] = np.where(
@@ -314,7 +313,6 @@ def compute_results(
         "할인(수량반영)",
     ]
     if basis_col is not None:
-        # 안분 기준 컬럼을 안분비율 앞쪽에 넣어 검증 용이하게
         insert_pos = detail_cols.index("안분비율")
         detail_cols.insert(insert_pos, basis_col)
 
@@ -347,6 +345,7 @@ def compute_results(
             "전체 총결제액합": [total_sales],
             "전체 매출총이익 합계": [total_profit],
             "전체 마진율(%)": [round(total_margin, 2) if pd.notna(total_margin) else np.nan],
+            "할인 차감 여부": ["차감" if deduct_discount else "미차감"],
             "배송비 규칙": [f"결제번호 1회(엑셀값) + ({miro_store_name} 포함 & 배송비=0이면 {miro_extra_shipping:,.0f} 추가차감)"],
             "결제액 안분 기준컬럼": [basis_col if basis_col is not None else "없음(스토어 균등 안분)"],
             "배송비 컬럼 사용": [used_ship_col],
@@ -378,18 +377,13 @@ def to_excel_bytes(
 # Streamlit UI
 # -----------------------------
 st.set_page_config(page_title="매출총이익 자동 계산기(다중 파일+안분)", layout="wide")
-st.title("매출총이익 자동 계산기 (복수 엑셀 병합 + 안분 + 배송비 예외)")
+st.title("매출총이익 자동 계산기 (복수 엑셀 병합 + 안분 + 배송비 예외 + 할인 토글)")
 
-with st.expander("현재 적용 로직(요약)", expanded=False):
+with st.expander("UI 토글 안내", expanded=False):
     st.markdown(
         """
-- **매출총이익 = 총 결제액 − (매입가×수량) − (개별상품할인액×수량) − 배송비**
-- **총 결제액**: 결제번호당 1회
-- **배송비**: 결제번호당 1회(엑셀값)
-  - 단, **결제번호에 미로상사가 포함되어 있고 & 엑셀 배송비가 0이면** 추가로 **4,000원** 차감
-- **복수 스토어 결제번호**:
-  - 총 결제액을 **실 주문상품액(결제기준)** 비율로 스토어별 안분(없으면 주문기준, 없으면 균등)
-  - 배송비도 동일 비율로 안분
+- ✅ **할인 차감** 토글을 켜면: 이익 계산에 `할인(수량반영)`을 **차감**
+- ❎ 토글을 끄면: 이익 계산에서 할인을 **차감하지 않음**
 """
     )
 
@@ -410,6 +404,7 @@ with right:
         value=4000,
         step=100,
     )
+    deduct_discount = st.toggle("할인 차감", value=True)  # ✅ 요청하신 UI 토글
     show_merged_preview = st.checkbox("결과 엑셀에 병합 원본 미리보기 시트 포함", value=False)
 
 if not uploaded_files:
@@ -433,6 +428,7 @@ try:
         merged_df,
         miro_store_name=miro_store_name,
         miro_extra_shipping=float(miro_extra_shipping),
+        deduct_discount=bool(deduct_discount),
     )
 except Exception as e:
     st.error(f"계산 중 오류가 발생했습니다: {e}")
@@ -440,7 +436,8 @@ except Exception as e:
 
 st.caption(
     f"업로드 파일 수: **{len(uploaded_files)}개** | 병합 행 수: **{len(merged_df):,}행** | "
-    f"배송비 컬럼: **{used_ship_col}** | 안분 기준: **{basis_col if basis_col else '없음(스토어 균등 안분)'}**"
+    f"배송비 컬럼: **{used_ship_col}** | 안분 기준: **{basis_col if basis_col else '없음(스토어 균등 안분)'}** | "
+    f"할인: **{'차감' if deduct_discount else '미차감'}**"
 )
 
 # Metrics
@@ -473,6 +470,6 @@ xlsx_bytes = to_excel_bytes(payment_result, store_payment_detail, store_date_res
 st.download_button(
     label="결과 엑셀 다운로드",
     data=xlsx_bytes,
-    file_name="매출총이익_결과(병합+안분+배송비예외).xlsx",
+    file_name=f"매출총이익_결과({'할인차감' if deduct_discount else '할인미차감'}).xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
